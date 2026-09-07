@@ -49,12 +49,20 @@ export const ConfigSchema = z.object({
   contributionThreshold: z.number().min(0).max(100).default(70),
   /** Optional ceiling on drafted expertise candidates per scan. 0 (default) means no cap: everything above the thresholds is drafted and the person decides. */
   maxCandidatesPerScan: z.number().int().min(0).default(0),
+  /** Unified gate: would the person plausibly post the response? 0-100. Casual replies to organization accounts need +10. */
+  worthThreshold: z.number().min(0).max(100).default(70),
   /** Themes routed to the conversational lane (no KB, line gate). Others are expertise. */
   conversationalThemes: z.array(z.string()).default(["Technology and startups", "General and internet culture"]),
   /** Conversational themes where priority-2 accounts need an exceptional line (+10). */
   conversationalStrictThemes: z.array(z.string()).default(["General and internet culture"]),
   conversationalThreshold: z.number().min(0).max(100).default(80),
-  maxConversationalCandidates: z.number().int().min(0).default(10),
+  maxConversationalCandidates: z.number().int().min(0).default(40),
+  /** Telegram surface (watch mode). Off unless both token and chat id are set. */
+  telegramBotToken: z.string().optional(),
+  telegramChatId: z.number().int().optional(),
+  /** "23-8" = hold cards from 23:00 to 08:00 in telegramTz. Empty disables. */
+  telegramQuietHours: z.string().optional(),
+  telegramTz: z.string().default("America/Chicago"),
   /** Rank bonus for priority-1 accounts (and penalty for priority-3). */
   priorityBoost: z.number().min(0).default(5),
 
@@ -72,9 +80,12 @@ export const ConfigSchema = z.object({
   // ---- Wingman / state ---------------------------------------------------
   chimeDir: z.string().min(1),
   daemonPort: z.number().int().positive().optional(),
-  replyMaxChars: z.number().int().positive().default(280),
+  /** Hard cap on a drafted reply. 1000 assumes X Premium (long posts); set 280 for a standard account. Normal length is governed by depth and instructions, not this cap. */
+  replyMaxChars: z.number().int().positive().default(1000),
   /** Drafts generated per candidate. 1 by default (♻️ goes to the model); set higher to pre-draft alternates served on ♻️ without a model call. */
   draftVariants: z.number().int().min(1).max(5).default(1),
+  /** Prompt profile. "baseline" is production. "candidate" is the consolidated prompt set under evaluation: one owner per decision, duplicates removed. */
+  promptProfile: z.enum(["baseline", "candidate"]).default("baseline"),
 });
 export type Config = z.infer<typeof ConfigSchema>;
 
@@ -139,10 +150,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     expertiseThreshold: optNumber(env.EXPERTISE_THRESHOLD),
     contributionThreshold: optNumber(env.CONTRIBUTION_THRESHOLD),
     maxCandidatesPerScan: optNumber(env.MAX_CANDIDATES_PER_SCAN),
+    worthThreshold: optNumber(env.WORTH_THRESHOLD),
     conversationalThemes: optList(env.CONVERSATIONAL_THEMES),
     conversationalStrictThemes: optList(env.CONVERSATIONAL_STRICT_THEMES),
     conversationalThreshold: optNumber(env.CONVERSATIONAL_THRESHOLD),
     maxConversationalCandidates: optNumber(env.MAX_CONVERSATIONAL_CANDIDATES),
+    telegramBotToken: optString(env.TELEGRAM_BOT_TOKEN),
+    telegramChatId: optNumber(env.TELEGRAM_CHAT_ID),
+    telegramQuietHours: optString(env.TELEGRAM_QUIET_HOURS),
+    telegramTz: optString(env.TELEGRAM_TZ),
     priorityBoost: optNumber(env.PRIORITY_BOOST),
     llmProvider: optString(env.LLM_PROVIDER),
     llmModelCheap: optString(env.LLM_MODEL_CHEAP),
@@ -156,6 +172,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     daemonPort: optNumber(env.DAEMON_PORT),
     replyMaxChars: optNumber(env.REPLY_MAX_CHARS),
     draftVariants: optNumber(env.DRAFT_VARIANTS),
+    promptProfile: env.PROMPT_PROFILE === "candidate" ? "candidate" : env.PROMPT_PROFILE === "baseline" ? "baseline" : undefined,
   });
   return ConfigSchema.parse(raw);
 }

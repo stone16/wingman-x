@@ -8,7 +8,7 @@ import { recordFills, runRegen } from "../src/pipeline/regen.js";
 import { createMemoryCandidateLog } from "../src/state/candidate-log.js";
 import { silentLogger } from "../src/util/logger.js";
 
-const config = ConfigSchema.parse({ chimeDir: "/tmp/unused" });
+const config = ConfigSchema.parse({ chimeDir: "/tmp/unused", draftVariants: 3 }); // alternates are served only when variants are enabled
 const kb = buildKBIndexFromDocs("tone", [
   { id: "custody", title: "Custody", markdown: "# Custody\n\n## Control\nControl agreements decide what a lender can enforce.\n" },
 ]);
@@ -111,5 +111,65 @@ describe("pre-drafted alternates", () => {
     expect(recordFills([filled, candidate({ id: "other-9", tweet_id: "9", status: "filled" })], log)).toBe(1);
     expect(log.get("1")).toMatchObject({ filled_reply: "the one he used", filled_at: "2026-09-04T05:00:00.000Z" });
     expect(recordFills([filled], log)).toBe(0);
+  });
+});
+
+describe("guided regeneration", () => {
+  it("applies the instruction, keeps the move, skips alternates, and clears the instruction afterwards", async () => {
+    const log = createMemoryCandidateLog();
+    log.upsert({ ...loggedRecord(["an alternate that predates the instruction"]), regen_instruction: "make it a question" });
+    const posted: CandidateInput[][] = [];
+    const prompts: string[] = [];
+    const llm = createFakeProvider(({ prompt }) => {
+      prompts.push(prompt);
+      return { suggested_reply: "Does the control agreement actually let the lender act?" };
+    });
+    const deps = {
+      config,
+      llm,
+      kb,
+      candidateLog: log,
+      state: { regen_handled: {} as Record<string, string> },
+      getCandidates: async () => [candidate()],
+      postCandidates: async (cs: CandidateInput[]) => {
+        posted.push(cs);
+        return { accepted: cs.length };
+      },
+      log: silentLogger,
+    };
+    const r = await runRegen(deps);
+    expect(r).toMatchObject({ regenerated: 1, served_from_alternates: 0 });
+    expect(prompts[0]).toContain("<instruction>\nmake it a question\n</instruction>");
+    expect(prompts[0]).toContain("Keep what the instruction does not ask to change");
+    expect(prompts[0]).toContain(`Move: `);
+    expect(posted[0]?.[0]?.suggested_reply).toBe("Does the control agreement actually let the lender act?");
+    const after = log.get("1");
+    expect(after?.regen_instruction).toBeUndefined();
+    expect(after?.instructions).toEqual(["make it a question"]);
+    expect(after?.moves).toEqual(["distinction", "distinction"]);
+    expect(after?.alternates).toEqual(["an alternate that predates the instruction"]);
+  });
+
+  it("takes the instruction from the in-memory map when there is no log record", async () => {
+    const log = createMemoryCandidateLog();
+    const prompts: string[] = [];
+    const llm = createFakeProvider(({ prompt }) => {
+      prompts.push(prompt);
+      return { suggested_reply: "Shorter." };
+    });
+    const instructions = new Map([["1", "shorter"]]);
+    await runRegen({
+      config,
+      llm,
+      kb,
+      candidateLog: log,
+      state: { regen_handled: {} as Record<string, string> },
+      getCandidates: async () => [candidate()],
+      postCandidates: async (cs: CandidateInput[]) => ({ accepted: cs.length }),
+      log: silentLogger,
+      instructions,
+    });
+    expect(prompts[0]).toContain("<instruction>\nshorter\n</instruction>");
+    expect(instructions.has("1")).toBe(false);
   });
 });

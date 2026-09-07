@@ -40,6 +40,17 @@ function ymd(d: Date): string {
 }
 
 /**
+ * X advanced search accepts a time-precise lower bound in the form
+ * `since:YYYY-MM-DD_HH:MM:SS_UTC`. Day-granular `since:` made every
+ * incremental scan refetch (and pay for) a whole day of posts to find the
+ * few new ones; the precise form returns only what is actually new.
+ */
+export function sinceStamp(d: Date, overlapMs = 5 * 60_000): string {
+  const t = new Date(d.getTime() - overlapMs);
+  return `${t.toISOString().slice(0, 19).replace("T", "_")}_UTC`;
+}
+
+/**
  * Build the X advanced-search query for one handle group. `since:` is
  * day-granular on X, so we start a day early and let the pipeline apply
  * the exact `since` timestamp client-side.
@@ -50,8 +61,7 @@ export function buildSearchQuery(
   opts: Pick<FetchOptions, "includeReplies" | "includeReposts">,
 ): string {
   const from = handles.map((h) => `from:${h}`).join(" OR ");
-  const sinceDay = new Date(since.getTime() - 24 * 3600 * 1000);
-  const parts = [`(${from})`, `since:${ymd(sinceDay)}`];
+  const parts = [`(${from})`, `since:${sinceStamp(since)}`];
   if (!opts.includeReplies) parts.push("-filter:replies");
   if (!opts.includeReposts) parts.push("-filter:retweets");
   return parts.join(" ");

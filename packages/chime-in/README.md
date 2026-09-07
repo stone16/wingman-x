@@ -9,8 +9,11 @@ ever posted automatically.
 
 ```text
 watchlist.csv ──▶ Apify (PostSource) ──▶ normalise ──▶ dedupe (processed.jsonl)
-      ──▶ mechanical filters ──▶ theme (cheap model) ──▶ expertise (KB retrieval + strong model)
-      ──▶ contribution (strong model) ──▶ rank + cap ──▶ draft (tone.md + KB) ──▶ POST /candidates
+      ──▶ mechanical filters ──▶ theme (cheap model, discovery label only)
+      ──▶ reason (strong model + beliefs digest + experience index: worth, move, depth, posture, energy, grounding)
+      ──▶ gate on WORTH_THRESHOLD ──▶ rank ──▶ ground (library / approved experience / dated fact archive, only as asked)
+      ──▶ draft (tone.md; reason freely, source every specific) ──▶ verify (cheap model; one repair, then `unverified:` flags)
+      ──▶ POST /candidates
       ──▶ Wingman extension: review → open post → fill composer → you press Post
 ```
 
@@ -113,10 +116,11 @@ Pressing ♻️ in the extension sets the candidate's status to
 (and `npm run regen`) does. The scan pre-drafts `DRAFT_VARIANTS` shapes of
 each reply (same move, different construction) and stores the unshown ones
 in `candidates.jsonl`; the first ♻️ clicks serve those instantly. Once they
-are used up, regen redrafts with the original post, the
-prior reply, the same KB excerpts, the tone guide, and the contribution
-angle, instructing the model to produce a meaningfully different reply,
-then re-POSTs. The daemon's merge keeps the candidate's status, so we
+are used up, a plain ♻️ re-runs the reasoning stage with every earlier
+contribution excluded, so the next draft makes a different point rather
+than reshaping the same one; a reply-with-instruction re-runs it with the
+instruction and the earlier contributions in view. The new contribution is
+grounded fresh, drafted, verified, and re-POSTed. The daemon's merge keeps the candidate's status, so we
 remember which click we served.
 
 ## Configuration
@@ -132,13 +136,15 @@ that matter most:
 | `MAX_POSTS_PER_ACCOUNT` | 10 | |
 | `INCLUDE_REPLIES` / `INCLUDE_REPOSTS` | false | |
 | `SCAN_LOOKBACK_HOURS` | 36 | first scan / fallback window |
-| `THEME_THRESHOLD` / `EXPERTISE_THRESHOLD` / `CONTRIBUTION_THRESHOLD` | 60 / 70 / 70 | gates, 0–100 |
-| `MAX_CANDIDATES_PER_SCAN` | 0 (no cap) | optional ceiling on drafted expertise candidates; by default everything above the thresholds is drafted and you decide in the Dock |
+| `THEME_THRESHOLD` | 60 | discovery gate, 0–100; the theme is a label, not a lane |
+| `WORTH_THRESHOLD` | 70 | the one quality gate: would the person plausibly post the response? Casual moves on organization feeds (priority 3) need +10. `EXPERTISE_THRESHOLD` / `CONTRIBUTION_THRESHOLD` are still parsed but unused |
+| `MAX_CANDIDATES_PER_SCAN` | 0 (no cap) | optional ceiling on drafted candidates; by default everything above the threshold is drafted and you decide in the Dock |
+| always-present context | `kb/beliefs-digest.md`, `kb/experience-index.md` | the person's working views and where firsthand grounding exists; read on every reasoning call. `kb/library/identity_and_boundaries.md` is the only source for first-person claims and is consulted on demand; `kb/sources/research-notes.md` is the dated fact archive; resolved facts cache in `<chimeDir>/verified_facts.jsonl`. Nothing is ever appended to the identity file automatically |
+| `npm run link -- <url> [instruction] [--dry-run]` | | draft one post by link from the shell, the same path as pasting a link into Telegram (no worth gate, `none` not allowed) |
 | `DRAFT_VARIANTS` | 1 | drafts per candidate; set 2–5 to pre-draft alternates that ♻️ serves with no model call |
-| `CONVERSATIONAL_THEMES` | Technology and startups, General and internet culture | themes routed to the conversational lane: no KB, a "good line" gate, `kb/conversational.md` as policy |
-| `CONVERSATIONAL_STRICT_THEMES` | General and internet culture | conversational themes where priority-2 accounts need +10 on the bar; priority 3 never enters the lane |
-| `CONVERSATIONAL_THRESHOLD` | 80 | line gate, 0–100 |
-| `MAX_CONVERSATIONAL_CANDIDATES` | 10 | cap on conversational-lane candidates per scan; 0 = no cap |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | unset | watch mode sends one Telegram message per card: Open in X (compose intent, you tap Post), ♻️ Regenerate (edits in place), ✅ Posted, 👎 Dismiss; `/scan`, `/status`, and `/pending [n]` (re-sends the newest n queued cards to the bottom of the chat) commands |
+| `TELEGRAM_QUIET_HOURS` / `TELEGRAM_TZ` | unset / America/Chicago | hold cards overnight, e.g. `23-8` |
+| `CONVERSATIONAL_THEMES` / `CONVERSATIONAL_STRICT_THEMES` / `CONVERSATIONAL_THRESHOLD` / `MAX_CONVERSATIONAL_CANDIDATES` | | legacy of the two-lane engine (removed 2026-09-05); still parsed, no effect. `kb/conversational.md` remains the casual-reply policy handed to the reasoning and drafting prompts |
 | `LLM_PROVIDER` | `auto` | `claude-cli`, `codex-cli`, `anthropic` |
 | `LLM_MODEL_CHEAP` / `STRONG` / `DRAFT` | provider defaults | per-tier model override |
 

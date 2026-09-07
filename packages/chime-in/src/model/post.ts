@@ -30,6 +30,8 @@ export const NormalizedPostSchema = z.object({
   like_count: z.number().int().nonnegative().default(0),
   view_count: z.number().int().nonnegative().default(0),
   quoted_tweet: QuotedPostSchema.nullable().default(null),
+  /** Earlier posts in the conversation this post replies to, oldest first. Empty for originals. */
+  thread: z.array(QuotedPostSchema).default([]),
   is_reply: z.boolean().default(false),
   is_repost: z.boolean().default(false),
   is_quote: z.boolean().default(false),

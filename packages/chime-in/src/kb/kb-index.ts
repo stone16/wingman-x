@@ -39,7 +39,11 @@ export interface KBIndex {
   constraints: string;
   /** One line per library file — what the person knows, at a glance. */
   summary: string;
-  search(query: string, k: number, opts?: { maxPerFile?: number }): KBChunk[];
+  /**
+   * BM25 over chunks. `minRelative` drops chunks scoring below that fraction of the top hit;
+   * `minMatched` requires that many distinct query terms in the chunk. Both default off.
+   */
+  search(query: string, k: number, opts?: { maxPerFile?: number; minRelative?: number; minMatched?: number }): KBChunk[];
   chunksByRef(refs: string[]): KBChunk[];
   chunksForFiles(files: string[], limit: number): KBChunk[];
 }
@@ -240,10 +244,15 @@ export function buildKBIndexFromDocs(tone: string, allDocs: KBDoc[]): KBIndex {
       const maxPerFile = opts.maxPerFile ?? 3;
       const qt = tokenize(query);
       if (qt.length === 0 || chunks.length === 0) return [];
-      const ranked = chunks
-        .map((c, i) => ({ c, s: score(qt, i) }))
+      const distinct = new Set(qt);
+      const matchedTerms = (i: number): number => { let m = 0; for (const q of distinct) if (tfCache[i]!.has(q)) m += 1; return m; };
+      let ranked = chunks
+        .map((c, i) => ({ c, s: score(qt, i), m: matchedTerms(i) }))
         .filter((r) => r.s > 0)
         .sort((a, b2) => b2.s - a.s);
+      const top = ranked[0]?.s ?? 0;
+      if (opts.minRelative !== undefined) ranked = ranked.filter((r) => r.s >= opts.minRelative! * top);
+      if (opts.minMatched !== undefined) ranked = ranked.filter((r) => r.m >= Math.min(opts.minMatched!, distinct.size));
       const perFile = new Map<string, number>();
       const out: KBChunk[] = [];
       for (const r of ranked) {

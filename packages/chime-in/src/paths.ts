@@ -22,6 +22,9 @@ export function chimePaths(chimeDir: string): {
   themes: string;
   watchPid: string;
   watchLog: string;
+  telegram: string;
+  scanInProgress: string;
+  factCache: string;
 } {
   return {
     watchlist: join(chimeDir, "watchlist.csv"),
@@ -32,5 +35,8 @@ export function chimePaths(chimeDir: string): {
     themes: join(chimeDir, "themes.txt"),
     watchPid: join(chimeDir, "watch.pid"),
     watchLog: join(chimeDir, "watch.log"),
+    telegram: join(chimeDir, "telegram.jsonl"),
+    scanInProgress: join(chimeDir, "scan.inprogress"),
+    factCache: join(chimeDir, "verified_facts.jsonl"),
   };
 }

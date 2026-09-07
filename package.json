@@ -34,7 +34,8 @@
     "kb:sync-substack": "npm --workspace @wingman-x/chime-in run kb:sync-substack --",
     "kb:sync-x": "npm --workspace @wingman-x/chime-in run kb:sync-x --",
     "watch": "npm --workspace @wingman-x/chime-in run watch --",
-    "watch:stop": "npm --workspace @wingman-x/chime-in run watch:stop --"
+    "watch:stop": "npm --workspace @wingman-x/chime-in run watch:stop --",
+    "watch:start": "npm --workspace @wingman-x/chime-in run watch:start --"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

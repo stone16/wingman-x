@@ -8,6 +8,7 @@ import {
   buildSearchQuery,
   createApifySource,
   inferInputStyle,
+  sinceStamp,
 } from "../src/sources/apify/apify-source.js";
 import { createFixtureSource } from "../src/sources/fixture-source.js";
 import { normalizeApifyItems } from "../src/sources/apify/normalize.js";
@@ -24,8 +25,8 @@ const accounts = [
 
 describe("query building", () => {
   it("builds a batched from: OR query with a day-early since and filters", () => {
-    expect(buildSearchQuery(["a", "b"], SINCE, opts)).toBe("(from:a OR from:b) since:2026-09-02 -filter:replies -filter:retweets");
-    expect(buildSearchQuery(["a"], SINCE, { includeReplies: true, includeReposts: true })).toBe("(from:a) since:2026-09-02");
+    expect(buildSearchQuery(["a", "b"], SINCE, opts)).toBe(`(from:a OR from:b) since:${sinceStamp(SINCE)} -filter:replies -filter:retweets`);
+    expect(buildSearchQuery(["a"], SINCE, { includeReplies: true, includeReposts: true })).toBe(`(from:a) since:${sinceStamp(SINCE)}`);
   });
 
   it("builds delicious_zebu inputs (sortBy, startDate, excludeReplies, per-search maxItems)", () => {
@@ -34,8 +35,8 @@ describe("query building", () => {
     const input = buildSearchInput(["a", "b", "c"], SINCE, opts, 2, "zebu");
     expect(input).toEqual({
       searchTerms: [
-        "(from:a OR from:b) since:2026-09-02 -filter:replies -filter:retweets",
-        "(from:c) since:2026-09-02 -filter:replies -filter:retweets",
+        `(from:a OR from:b) since:${sinceStamp(SINCE)} -filter:replies -filter:retweets`,
+        `(from:c) since:${sinceStamp(SINCE)} -filter:replies -filter:retweets`,
       ],
       sortBy: "Latest",
       startDate: "2026-09-02",
@@ -147,5 +148,12 @@ describe("createFixtureSource", () => {
     const bad = resolve(dir, "bad.json");
     writeFileSync(bad, JSON.stringify({ nope: true }));
     await expect(createFixtureSource(bad).fetchPosts(accounts, SINCE, opts)).rejects.toThrow(/expected an array/);
+  });
+});
+
+describe("sinceStamp", () => {
+  it("emits X's time-precise since format with a small overlap", () => {
+    expect(sinceStamp(new Date("2026-09-05T21:34:08.705Z"))).toBe("2026-09-05_21:29:08_UTC");
+    expect(sinceStamp(new Date("2026-09-05T00:02:00.000Z"), 0)).toBe("2026-09-05_00:02:00_UTC");
   });
 });

@@ -18,7 +18,9 @@
     "kb:sync-x": "tsx bin/kb-sync-x.ts",
     "reply:audit": "tsx bin/reply-audit.ts",
     "watch": "tsx bin/watch.ts",
-    "watch:stop": "tsx bin/watch-stop.ts"
+    "watch:stop": "tsx bin/watch-stop.ts",
+    "watch:start": "tsx bin/watch-start.ts",
+    "link": "tsx bin/link.ts"
   },
   "dependencies": {
     "@wingman-x/agent-kit": "*",

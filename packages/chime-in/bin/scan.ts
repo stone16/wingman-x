@@ -41,6 +41,10 @@ async function main(): Promise<number> {
       llm: rt.llm,
       kb: rt.kb,
       policy: rt.policy,
+      digest: rt.digest,
+      experienceIndex: rt.experienceIndex,
+      facts: rt.facts,
+      factCachePath: rt.paths.factCache,
       candidateLog: rt.candidateLog,
       state: rt.state,
       getCandidates: () => client.getCandidates(),
@@ -72,6 +76,10 @@ async function main(): Promise<number> {
       llm: rt.llm,
       kb: rt.kb,
       policy: rt.policy,
+      digest: rt.digest,
+      experienceIndex: rt.experienceIndex,
+      facts: rt.facts,
+      factCachePath: rt.paths.factCache,
       themes: rt.themes,
       processed: rt.processed,
       candidateLog: rt.candidateLog,
@@ -84,8 +92,18 @@ async function main(): Promise<number> {
       reprocess: flags.reprocess,
       ...(flags.handles ? { handles: flags.handles } : {}),
       ...(flags.limit !== undefined ? { limit: flags.limit } : {}),
+      // First-timers (never fetched before) get the lookback window once.
+      knownHandles: new Set(Object.keys(rt.state.accounts_seen ?? {})),
+      backfillSince: new Date(now.getTime() - rt.config.lookbackHours * 3600 * 1000),
     },
   );
+  {
+    const seen = (rt.state.accounts_seen ??= {});
+    for (const h of summary.accounts_fetched_ok) {
+      const key = h.toLowerCase();
+      if (seen[key] === undefined) seen[key] = now.toISOString();
+    }
+  }
   if (!flags.dryRun) {
     rt.state.last_scan_completed_at = new Date().toISOString();
     saveScanState(rt.paths.state, rt.state);

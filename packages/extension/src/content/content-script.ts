@@ -57,6 +57,13 @@ let currentRoute: RouteState | null = null;
  * tweet or on leaving a tweet-detail page.
  */
 let activeController: WidgetController | null = null;
+// Live objects behind the active widget. The Card's buttons read
+// `candidate.suggestedReply` at click time and the controller re-mounts the
+// Dock from `payload` after a collapse, so updating these in place keeps a
+// refreshed reply consistent everywhere without tearing the widget down.
+let activeCandidate: ReturnType<typeof extractCandidateView> | null = null;
+let activePayload: Record<string, unknown> | null = null;
+let activePort: number | null = null;
 
 function disposeActiveController(): void {
   if (activeController !== null) {
@@ -278,6 +285,9 @@ async function runOnce(): Promise<void> {
     try {
       disposeActiveController();
       const candidate = extractCandidateView(payload);
+      activeCandidate = candidate;
+      activePayload = typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : null;
+      activePort = port;
       activeController = createWidgetController({
         tweetId,
         suggestionPayload: payload,
@@ -361,9 +371,44 @@ let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 function refreshCurrentRoute(): void {
   const tweetId = parseTweetId(readPageUrl());
   if (tweetId === null) return;
+  const cardOpen = document.querySelector<HTMLElement>('[data-testid="twh-card-reply-preview"]') !== null;
+  if (cardOpen && activeController !== null && activeCandidate !== null && activePort !== null) {
+    // Expanded Card: update in place so it stays expanded where the person
+    // left it. Only the collapsed Dock is cheap to remount.
+    void updateCardInPlace(tweetId, activePort);
+    return;
+  }
   // Force runOnce past its same-route short-circuit.
   disposeCurrentRoute();
   void runOnce();
+}
+
+async function updateCardInPlace(tweetId: string, port: number): Promise<void> {
+  const res = await tryFetchSuggestion(port, tweetId, new AbortController().signal);
+  if (res === null || res.status !== 200) {
+    // Candidate gone (dismissed elsewhere) or daemon hiccup: fall back to a full re-run.
+    disposeCurrentRoute();
+    void runOnce();
+    return;
+  }
+  let payload: unknown;
+  try {
+    payload = await res.json();
+  } catch {
+    return;
+  }
+  if (!isDaemonSuggestionResponse(payload, tweetId) || activeCandidate === null) return;
+  const fresh = extractCandidateView(payload);
+  Object.assign(activeCandidate, fresh);
+  if (activePayload !== null && typeof payload === "object" && payload !== null) Object.assign(activePayload, payload);
+  const preview = document.querySelector<HTMLElement>('[data-testid="twh-card-reply-preview"]');
+  if (preview !== null) {
+    preview.textContent = fresh.suggestedReply;
+    preview.classList.remove("twh-regenerating");
+  }
+  const reason = document.querySelector<HTMLElement>('[data-testid="twh-card-match-reason"]');
+  if (reason !== null) reason.textContent = fresh.matchReason;
+  console.info(`${LOG_PREFIX} card updated in place for ${tweetId}`);
 }
 
 function installLiveRefresh(): void {

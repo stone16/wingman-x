@@ -34,7 +34,7 @@ const kb = buildKBIndexFromDocs("Be direct.", [
   },
 ]);
 
-/** Scripted model: creditpm's liquidity post is a strong candidate; alice's settlement post passes theme+expertise but fails contribution; macro fails theme. */
+/** Scripted model: creditpm's liquidity post is a strong candidate; alice's settlement post passes theme but reasoning finds nothing to add; macro fails theme. */
 const scripted: FakeHandler = ({ label, prompt }) => {
   if (label.startsWith("theme")) {
     const ids = [...prompt.matchAll(/tweet_id="(\d+)"/g)].map((m) => m[1]!);
@@ -46,16 +46,13 @@ const scripted: FakeHandler = ({ label, prompt }) => {
       }),
     };
   }
-  if (label.startsWith("expertise")) {
-    const refs = [...prompt.matchAll(/\[K\d+\] (\S+)/g)].map((m) => m[1]!);
-    return { expertise_score: 90, relevant_kb_refs: refs.slice(0, 1), expertise_reason: "kb applies" };
-  }
-  if (label.startsWith("contribution")) {
-    const settlement = prompt.includes("Theme: Settlement");
+  if (label.startsWith("reason")) {
+    const settlement = /Theme[^\n]*: Settlement/.test(prompt);
     return settlement
-      ? { contribution_score: 85, contribution_angle: "agree", reason: "nothing to add", move: "none", depth: "light", posture: "announcement" }
-      : { contribution_score: 87, contribution_angle: "Challenges the liquidity-first assumption.", reason: "disagrees" };
+      ? { worth: 85, reason: "nothing to add", move: "none", depth: "light", posture: "announcement", energy: "casual", angle: "agree", grounding: "none" }
+      : { worth: 87, reason: "disagrees", move: "challenge", depth: "substantive", posture: "argument", energy: "serious", angle: "Challenges the liquidity-first assumption.", grounding: "kb", kb_query: "secondary liquidity lender financing" };
   }
+  if (label.startsWith("verify")) return { specifics: [] };
   if (label.startsWith("draft")) return { suggested_reply: "Financing utility comes before secondary liquidity; the lender's eligibility test is the real gate." };
   throw new Error(`unexpected label ${label}`);
 };
@@ -104,12 +101,13 @@ describe("runScan", () => {
       id: "chime-2001000000000000001",
       author_handle: "@creditpm",
       match_category: "selected",
-      kb_refs: ["library/private-credit.md", "tone.md"],
     });
-    expect(c.match_reason).toContain("Theme: Private credit (91) | Expertise: 90 | Contribution: 87 | Angle: Challenges");
+    expect(c.kb_refs).toContain("library/private-credit.md");
+    expect(c.kb_refs).toContain("tone.md");
+    expect(c.match_reason).toContain("Theme: Private credit (91) | Worth: 87 | Move: challenge | Grounding: kb | Angle: Challenges");
     // Every decided post is in the processed store; the sent one is a candidate.
     expect(d.processed.get("2001000000000000001")?.decision).toBe("candidate");
-    expect(d.processed.get("2001000000000000002")).toMatchObject({ decision: "filtered", stage: "contribution" });
+    expect(d.processed.get("2001000000000000002")).toMatchObject({ decision: "filtered", stage: "reason" });
     // move "none" wins even though the score (85) clears the threshold.
     expect(d.processed.get("2001000000000000002")?.reason).toMatch(/^move none \(85\)/);
     expect(d.processed.get("2001000000000000005")).toMatchObject({ decision: "filtered", stage: "theme" });
@@ -149,7 +147,7 @@ describe("runScan", () => {
     let failOnce = true;
     const d = deps({
       llm: createFakeProvider((args) => {
-        if (args.label === "contribution:2001000000000000001" && failOnce) {
+        if (args.label === "reason:2001000000000000001" && failOnce) {
           failOnce = false;
           throw new Error("model down");
         }
@@ -175,7 +173,7 @@ describe("runScan", () => {
 
   it("ranks out above-threshold posts beyond the cap, honours --handles and --limit, and reports account failures", async () => {
     const generous = createFakeProvider((args) => {
-      if (args.label.startsWith("contribution")) return { contribution_score: 80, contribution_angle: "angle", reason: "r" };
+      if (args.label.startsWith("reason")) return { worth: 80, reason: "r", move: "agree_extend", depth: "substantive", posture: "other", energy: "serious", angle: "angle", grounding: "none" };
       return scripted(args);
     });
     const d = deps({

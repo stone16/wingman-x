@@ -21,6 +21,8 @@ export const ScanStateSchema = z.object({
   last_scan_started_at: z.string().optional(),
   last_scan_completed_at: z.string().optional(),
   regen_handled: z.record(z.string(), z.string()).default({}),
+  /** handle (lowercase) → ISO time of its first successful fetch. New handles get a backfill window on their first scan. */
+  accounts_seen: z.record(z.string(), z.string()).optional(),
 });
 export type ScanState = z.infer<typeof ScanStateSchema>;
 
@@ -45,6 +47,12 @@ export function mergeScanState(target: ScanState, other: ScanState): ScanState {
   for (const [id, at] of Object.entries(other.regen_handled)) {
     const mine = target.regen_handled[id];
     if (mine === undefined || at > mine) target.regen_handled[id] = at;
+  }
+  if (other.accounts_seen) {
+    const seen = (target.accounts_seen ??= {});
+    for (const [h, at] of Object.entries(other.accounts_seen)) {
+      if (seen[h] === undefined || at < seen[h]!) seen[h] = at;
+    }
   }
   const later = (x?: string, y?: string): string | undefined => (x === undefined ? y : y === undefined ? x : x > y ? x : y);
   target.last_scan_started_at = later(target.last_scan_started_at, other.last_scan_started_at);

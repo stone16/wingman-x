@@ -3,7 +3,7 @@ import type { Config } from "../config.js";
 import type { KBIndex } from "../kb/kb-index.js";
 import type { LLMProvider } from "../llm/provider.js";
 import type { NormalizedPost } from "../model/post.js";
-import type { PostSource } from "../sources/post-source.js";
+import type { FetchPostsResult, PostSource } from "../sources/post-source.js";
 import type { CandidateLog } from "../state/candidate-log.js";
 import type { ProcessedStore } from "../state/processed-store.js";
 import { mapWithConcurrency, settle } from "../util/concurrency.js";
@@ -11,13 +11,14 @@ import type { Logger } from "../util/logger.js";
 import type { WatchAccount } from "../watchlist.js";
 import { toWingmanCandidate, type ScoredDraft } from "../wingman/candidate-map.js";
 import { rankCandidates } from "./rank.js";
-import { assessContribution, type ReplyDepth, type ReplyMove } from "./stages/contribution.js";
+import type { ReplyDepth } from "./stages/contribution.js";
+import { reasonAboutPost, type ReasonMove, type ReasonResult } from "./stages/reason.js";
+import { resolveGrounding, type FactArchive } from "./ground.js";
+import { describeEvidence, reconsiderAngle } from "./reconsider.js";
+import { expandTruncated } from "../sources/full-text.js";
 import { draftReply, toSentenceCase } from "./stages/draft.js";
-import { assessExpertise, type ExpertiseOutcome } from "./stages/expertise.js";
 import { mechanicalFilter, type MechanicalReason } from "./stages/mechanical.js";
 import { classifyThemes, type ThemeResult } from "./stages/theme.js";
-import { assessLine } from "./stages/line.js";
-import { conversationalEligibility, laneForTheme, nextLineType, type LineType } from "./lane.js";
 
 /**
  * The scan orchestrator. Pure with respect to I/O — every side effect
@@ -35,8 +36,14 @@ export interface ScanDeps {
   llm: LLMProvider;
   kb: KBIndex;
   themes: readonly string[];
-  /** Conversational-lane reply policy (kb/conversational.md). Lane disabled when absent. */
+  /** Casual-reply policy (kb/conversational.md). */
   policy?: string;
+  /** Always present for the reasoning stage: the person's working views and where firsthand grounding may exist. */
+  digest?: string;
+  experienceIndex?: string;
+  /** Dated research archive for on-demand fact resolution, and the cache of resolved facts. */
+  facts?: FactArchive;
+  factCachePath?: string;
   processed: ProcessedStore;
   candidateLog: CandidateLog;
   /** `null` in dry-run: nothing is sent, nothing is marked processed. */
@@ -54,13 +61,20 @@ export interface ScanOptions {
   handles?: string[];
   /** Cap posts admitted to the LLM stages (debugging). */
   limit?: number;
+  /**
+   * Handles (lowercase) already fetched in earlier scans. Handles NOT in this
+   * set are first-timers and are fetched from `backfillSince` instead of
+   * `since`, so a newly added account contributes its recent history once.
+   */
+  knownHandles?: ReadonlySet<string>;
+  backfillSince?: Date;
 }
 
 export interface PostOutcome {
   tweet_id: string;
   author_handle: string;
   tweet_url: string;
-  stage: "mechanical" | "theme" | "expertise" | "contribution" | "line" | "rank" | "draft" | "sent" | "error";
+  stage: "mechanical" | "theme" | "expertise" | "contribution" | "line" | "reason" | "rank" | "draft" | "sent" | "error";
   decision: "filtered" | "candidate" | "error";
   reason?: string;
   theme?: string;
@@ -79,6 +93,8 @@ export interface ScanSummary {
   dry_run: boolean;
   accounts_requested: number;
   accounts_fetched: number;
+  /** Handles (as given) whose fetch succeeded this run; callers record them as seen. */
+  accounts_fetched_ok: string[];
   account_failures: Array<{ handle: string; error: string }>;
   posts_fetched: number;
   raw_items: number;
@@ -109,14 +125,49 @@ export interface ScanSummary {
     depth?: string;
     posture?: string;
     lane?: string;
+    grounding?: string;
+    worth?: number;
   }>;
   outcomes: PostOutcome[];
+}
+
+/** Split the accounts to fetch into ones seen before and first-timers. No known set → everyone is known. */
+export function splitFirstTimers(
+  accounts: WatchAccount[],
+  known?: ReadonlySet<string>,
+): { known: WatchAccount[]; fresh: WatchAccount[] } {
+  if (known === undefined) return { known: accounts, fresh: [] };
+  const fresh = accounts.filter((a) => !known.has(a.handle.toLowerCase()));
+  return { known: accounts.filter((a) => known.has(a.handle.toLowerCase())), fresh };
+}
+
+export function mergeFetches(a: FetchPostsResult | null, b: FetchPostsResult): FetchPostsResult {
+  if (a === null) return b;
+  const seenIds = new Set(a.posts.map((p) => p.tweet_id));
+  return {
+    source: a.source,
+    posts: [...a.posts, ...b.posts.filter((p) => !seenIds.has(p.tweet_id))],
+    accounts: [...a.accounts, ...b.accounts],
+    raw_count: a.raw_count + b.raw_count,
+  };
 }
 
 /**
  * The last few replies we actually sent (from candidates.jsonl), so the
  * drafter knows what has just been said and does not recycle it.
  */
+/** The reasoner's context on repetition: what was contributed on other posts recently. Context, not a rule. */
+export function recentContributions(log: CandidateLog, recent = 10): string[] {
+  return log
+    .all()
+    .sort((a, b) => Date.parse(b.recorded_at) - Date.parse(a.recorded_at))
+    .slice(0, recent)
+    .map((r) => r.contribution_angle)
+    .filter((a): a is string => typeof a === "string" && a.trim().length > 0)
+    .map((a) => a.replace(/\s+/g, " ").slice(0, 140));
+}
+
+/** Recent suggestions drafted by this system (not necessarily posted). Baseline drafter context only. */
 export function buildEditorialMemory(log: CandidateLog, recent = 12): string {
   const sent = log
     .all()
@@ -133,11 +184,8 @@ interface Scored {
   post: NormalizedPost;
   account: WatchAccount;
   theme: ThemeResult;
-  expertise: ExpertiseOutcome;
-  contribution_score: number;
-  contribution_angle: string;
-  contribution_reason: string;
-  move: ReplyMove;
+  reason: ReasonResult;
+  move: ReasonMove;
   depth: ReplyDepth;
   posture: string;
 }
@@ -200,11 +248,24 @@ export async function runScan(deps: ScanDeps, opts: ScanOptions): Promise<ScanSu
   log.info("Starting scan");
   log.info(`${accounts.length} accounts requested (source: ${deps.source.name}, since ${opts.since.toISOString()})`);
 
-  const fetched = await deps.source.fetchPosts(accounts, opts.since, {
+  const fetchOpts = {
     maxPostsPerAccount: config.maxPostsPerAccount,
     includeReplies: config.includeReplies,
     includeReposts: config.includeReposts,
-  });
+  };
+  const { known: knownAccounts, fresh: freshAccounts } = splitFirstTimers(accounts, opts.knownHandles);
+  const backfillSince = opts.backfillSince !== undefined && opts.backfillSince < opts.since ? opts.backfillSince : undefined;
+  let fetched: FetchPostsResult;
+  if (opts.knownHandles !== undefined && backfillSince !== undefined && freshAccounts.length > 0) {
+    log.info(`${freshAccounts.length} account(s) not fetched before; backfilling them since ${backfillSince.toISOString()}`);
+    const [a, b] = await Promise.all([
+      knownAccounts.length > 0 ? deps.source.fetchPosts(knownAccounts, opts.since, fetchOpts) : null,
+      deps.source.fetchPosts(freshAccounts, backfillSince, fetchOpts),
+    ]);
+    fetched = mergeFetches(a, b);
+  } else {
+    fetched = await deps.source.fetchPosts(accounts, opts.since, fetchOpts);
+  }
   const failures = fetched.accounts.filter((a) => !a.ok);
   log.info(`${fetched.accounts.length - failures.length} accounts successfully fetched`);
   if (failures.length > 0) {
@@ -230,6 +291,9 @@ export async function runScan(deps: ScanDeps, opts: ScanOptions): Promise<ScanSu
       if (r.reason !== "seen") markFiltered(post, "mechanical", r.reason);
     }
   }
+  // Long posts arrive cut at 280 from the actor; fill in the full text before anything reads them.
+  const expanded = await expandTruncated(fetched.posts);
+  if (expanded > 0) log.info(`${expanded} truncated post(s) expanded to full text`);
   const unseen = fetched.posts.length - breakdown.seen;
   const removedByBasic = breakdown.repost + breakdown.reply + breakdown.empty + breakdown.spam;
   log.info(`${unseen} unseen posts`);
@@ -272,94 +336,50 @@ export async function runScan(deps: ScanDeps, opts: ScanOptions): Promise<ScanSu
   }
   log.info(`${themed.length} theme candidates`);
 
-  // ---- Lane split ------------------------------------------------------
-  // Conversational themes skip the KB entirely; without a policy text the
-  // lane is off and everything goes through expertise as before.
-  const expertiseThemed = deps.policy ? themed.filter(({ theme }) => laneForTheme(theme.theme, config) === "expertise") : themed;
-  const conversationalThemed = deps.policy ? themed.filter(({ theme }) => laneForTheme(theme.theme, config) === "conversational") : [];
-  if (conversationalThemed.length > 0) log.info(`${conversationalThemed.length} routed to the conversational lane`);
-
-  // ---- Stage 3: expertise --------------------------------------------
-  const expertiseResults = await mapWithConcurrency(expertiseThemed, config.llmConcurrency, ({ post, theme }) =>
-    settle(assessExpertise(post, theme.theme, { llm: deps.llm, kb: deps.kb, topK: config.kbTopK })),
+  // ---- Stage 3: reason (unified) -------------------------------------
+  // One call per post: is there a response the person would plausibly post,
+  // what does it do (move), how deep, and how much grounding it needs.
+  // Themes and the watchlist only decided the post was worth looking at.
+  const recentAngles = config.promptProfile === "candidate" ? recentContributions(deps.candidateLog) : undefined;
+  const reasonCtx = { digest: deps.digest ?? "", experienceIndex: deps.experienceIndex ?? "", boundaries: deps.kb.constraints, policy: deps.policy, profile: config.promptProfile, ...(recentAngles && recentAngles.length > 0 ? { recentAngles } : {}) };
+  const accountOf = (post: NormalizedPost): WatchAccount => byHandle.get(post.author_handle.toLowerCase()) ?? { handle: post.author_handle, priority: 2 as const };
+  const reasonResults = await mapWithConcurrency(themed, config.llmConcurrency, ({ post, theme }) =>
+    settle(reasonAboutPost(post, theme.theme, { ...reasonCtx, authorPriority: accountOf(post).priority }, { llm: deps.llm })),
   );
-  const expert: Array<{ post: NormalizedPost; theme: ThemeResult; expertise: ExpertiseOutcome }> = [];
-  expertiseThemed.forEach(({ post, theme }, i) => {
-    const r = expertiseResults[i]!;
-    if (!r.ok) {
-      markError(post, "expertise", r.error.message);
-      return;
-    }
-    if (r.value.expertise_score < config.expertiseThreshold) {
-      markFiltered(
-        post,
-        "expertise",
-        `expertise ${r.value.expertise_score} < ${config.expertiseThreshold}: ${r.value.expertise_reason}`,
-        { theme: theme.theme_score, expertise: r.value.expertise_score },
-        { theme: theme.theme, theme_score: theme.theme_score, expertise_score: r.value.expertise_score },
-      );
-      return;
-    }
-    expert.push({ post, theme, expertise: r.value });
-  });
-  log.info(`${expert.length} expertise candidates`);
-
-  // ---- Stage 4: contribution -----------------------------------------
-  const contributionResults = await mapWithConcurrency(expert, config.llmConcurrency, ({ post, theme, expertise }) => {
-    // Use the excerpts the expertise stage confirmed; fall back to the
-    // retrieved set so the model still sees the KB when nothing was cited.
-    const chunks = expertise.chunks.length > 0 ? expertise.chunks : expertise.retrieved;
-    return settle(
-      assessContribution(post, theme.theme, expertise.expertise_reason, chunks, {
-        llm: deps.llm,
-        constraints: deps.kb.constraints,
-      }),
-    );
-  });
   const scored: Scored[] = [];
-  expert.forEach(({ post, theme, expertise }, i) => {
-    const r = contributionResults[i]!;
+  themed.forEach(({ post, theme }, i) => {
+    const r = reasonResults[i]!;
     if (!r.ok) {
-      markError(post, "contribution", r.error.message);
+      markError(post, "reason", r.error.message);
       return;
     }
-    const scores = { theme: theme.theme_score, expertise: expertise.expertise_score, contribution: r.value.contribution_score };
-    // "none" is an explicit decision that nothing worth saying exists. It
-    // wins regardless of the score: no reply beats a manufactured one.
-    if (r.value.move === "none" || r.value.contribution_score < config.contributionThreshold) {
+    const account = accountOf(post);
+    const casual = r.value.move === "light_reaction" || r.value.move === "irony" || r.value.move === "thinking_out_loud";
+    // Author is a soft prior, not a gate: a casual reply to an organization's feed needs to be exceptional.
+    const bar = config.worthThreshold + (account.priority === 3 && casual ? 10 : 0);
+    const scores = { theme: theme.theme_score, contribution: r.value.worth };
+    if (r.value.move === "none" || r.value.worth < bar) {
       markFiltered(
         post,
-        "contribution",
-        r.value.move === "none"
-          ? `move none (${r.value.contribution_score}): ${r.value.reason}`
-          : `contribution ${r.value.contribution_score} < ${config.contributionThreshold}: ${r.value.reason}`,
+        "reason",
+        r.value.move === "none" ? `move none (${r.value.worth}): ${r.value.reason}` : `worth ${r.value.worth} < ${bar}: ${r.value.reason}`,
         scores,
-        {
-          theme: theme.theme,
-          theme_score: theme.theme_score,
-          expertise_score: expertise.expertise_score,
-          contribution_score: r.value.contribution_score,
-          contribution_angle: r.value.contribution_angle,
-        },
+        { theme: theme.theme, theme_score: theme.theme_score, contribution_score: r.value.worth, contribution_angle: r.value.angle },
       );
       return;
     }
-    const account = byHandle.get(post.author_handle.toLowerCase()) ?? { handle: post.author_handle, priority: 2 as const };
     scored.push({
       post,
       account,
       theme,
-      expertise,
-      contribution_score: r.value.contribution_score,
-      contribution_angle: r.value.contribution_angle,
-      contribution_reason: r.value.reason,
+      reason: r.value,
       move: r.value.move,
       // A short post never earns a deep reply, whatever the model said.
       depth: r.value.depth === "deep" && [...post.tweet_text].length < 100 ? "substantive" : r.value.depth,
       posture: r.value.posture,
     });
   });
-  log.info(`${scored.length} contribution candidates`);
+  log.info(`${scored.length} worth replying (of ${themed.length} reasoned)`);
 
   // ---- Rank ------------------------------------------------------------
   const { selected, rankedOut } = rankCandidates(
@@ -367,7 +387,8 @@ export async function runScan(deps: ScanDeps, opts: ScanOptions): Promise<ScanSu
       ...s,
       tweet_id: s.post.tweet_id,
       theme_score: s.theme.theme_score,
-      expertise_score: s.expertise.expertise_score,
+      expertise_score: s.reason.worth,
+      contribution_score: s.reason.worth,
       account_priority: s.account.priority,
       created_at: s.post.created_at,
     })),
@@ -378,81 +399,81 @@ export async function runScan(deps: ScanDeps, opts: ScanOptions): Promise<ScanSu
       s.post,
       "rank",
       `ranked out (cap ${config.maxCandidatesPerScan})`,
-      { theme: s.theme_score, expertise: s.expertise_score, contribution: s.contribution_score },
-      {
-        theme: s.theme.theme,
-        theme_score: s.theme_score,
-        expertise_score: s.expertise_score,
-        contribution_score: s.contribution_score,
-        contribution_angle: s.contribution_angle,
-      },
+      { theme: s.theme_score, contribution: s.reason.worth },
+      { theme: s.theme.theme, theme_score: s.theme_score, contribution_score: s.reason.worth, contribution_angle: s.reason.angle },
     );
   }
   if (rankedOut.length > 0) log.info(`${rankedOut.length} above threshold but ranked out by MAX_CANDIDATES_PER_SCAN`);
 
-  // ---- Stage 5: draft ---------------------------------------------------
-  // Drafts run in parallel. Cross-candidate variety comes from what is known
-  // before drafting: each draft sees the other candidates' angles (so the set
-  // does not make one point), and the nudges are derived from rank order.
+  // ---- Stage 4: ground + draft + verify ---------------------------------
+  // Grounding is fetched only as the reasoning stage asked for it. Drafts run
+  // in parallel; variety comes from what is known before drafting.
   const editorial = buildEditorialMemory(deps.candidateLog);
-  const angleOf = (s: Scored): string => `[@${s.post.author_handle}, ${s.move}] ${s.contribution_angle}`;
+  const angleOf = (s: Scored): string => `[@${s.post.author_handle}, ${s.move}] ${s.reason.angle}`;
   const drafts = await mapWithConcurrency(selected, config.llmConcurrency, async (s, i) => {
-    const chunks = s.expertise.chunks.length > 0 ? s.expertise.chunks : s.expertise.retrieved.slice(0, 4);
+    const g = await resolveGrounding(s.reason, s.post, s.theme.theme, { kb: deps.kb, facts: deps.facts, factCachePath: deps.factCachePath, topK: config.kbTopK, llm: deps.llm });
     const prev = selected[i - 1];
     const prev2 = selected[i - 2];
-    // Soft variety: same move as the candidate ranked just above → vary the
-    // construction, never the move. Only the top-ranked reply may open by
-    // conceding. After two non-light replies in a row, ask for a short one
-    // unless this post is an argument that needs the room.
-    const avoidMoves: ReplyMove[] = prev !== undefined && prev.move === s.move ? [prev.move] : [];
+    const avoidMoves: ReasonMove[] = prev !== undefined && prev.move === s.move ? [prev.move] : [];
     const twoLongAbove = prev !== undefined && prev2 !== undefined && prev.depth !== "light" && prev2.depth !== "light";
     const nudgeShort = twoLongAbove && s.depth !== "light" && !["argument", "technical_explanation"].includes(s.posture);
-    const result = await settle(
-      draftReply({
-        post: s.post,
-        theme: s.theme.theme,
-        angle: s.contribution_angle,
-        chunks,
-        tone: deps.kb.tone,
-        maxChars: config.replyMaxChars,
-        constraints: deps.kb.constraints,
-        editorial,
-        avoidPoints: selected.filter((o) => o !== s).map(angleOf),
-        move: s.move,
-        depth: s.depth,
-        posture: s.posture,
-        avoidMoves,
-        avoidConcedeOpener: i > 0,
-        ...(nudgeShort ? { lengthNudge: "short" as const } : {}),
-        llm: deps.llm,
-      }),
-    );
+    const common = {
+      post: s.post,
+      theme: s.theme.theme,
+      angle: s.reason.angle,
+      authorPoint: s.reason.author_point,
+      chunks: g.chunks,
+      tone: deps.kb.tone,
+      digest: deps.digest,
+      boundaries: deps.kb.constraints,
+      policy: deps.policy,
+      profile: config.promptProfile,
+      maxChars: config.replyMaxChars,
+      editorial,
+      avoidPoints: selected.filter((o) => o !== s).map(angleOf),
+      move: s.move,
+      depth: s.depth,
+      posture: s.posture,
+      energy: s.reason.energy,
+      experience: g.experience,
+      fact: g.fact,
+      unresolved: g.unresolved,
+      llm: deps.llm,
+    };
+    let result = await settle(draftReply({ ...common, avoidMoves, avoidConcedeOpener: i > 0, ...(nudgeShort ? { lengthNudge: "short" as const } : {}) }));
     if (!result.ok) return result;
-    // Alternates: the same move, meaningfully different shape. Served on
-    // ♻️ without another model call, so the person sees a real choice.
+    let reasonUsed: ReasonResult = s.reason;
+    let groundingUsed = g;
+    if (config.promptProfile === "candidate" && result.value.angleProblem) {
+      // The drafter could not say it without an unsupported assumption: let the reasoner pick again, once.
+      const outcome = await reconsiderAngle(s.post, s.theme.theme, s.reason, result.value.angleProblem, { ...reasonCtx, authorPriority: s.account.priority }, { llm: deps.llm }, describeEvidence(g));
+      if (outcome.kind === "none") {
+        return { ok: true as const, value: { dropped: `reconsidered: none (${result.value.angleProblem})` } };
+      }
+      if (outcome.kind === "unavailable") log.warn(`reconsideration unavailable for ${s.post.tweet_url}, keeping the flagged draft: ${outcome.error}`);
+      if (outcome.kind === "reasoned") {
+        const r2 = outcome.reason;
+        // The new contribution faces the same bar as the first one.
+        const casual2 = r2.move === "light_reaction" || r2.move === "irony" || r2.move === "thinking_out_loud";
+        const bar2 = config.worthThreshold + (s.account.priority === 3 && casual2 ? 10 : 0);
+        if (r2.worth < bar2) {
+          return { ok: true as const, value: { dropped: `reconsidered: worth ${r2.worth} < ${bar2} (${result.value.angleProblem})` } };
+        }
+        const g2 = await resolveGrounding(r2, s.post, s.theme.theme, { kb: deps.kb, facts: deps.facts, factCachePath: deps.factCachePath, topK: config.kbTopK, llm: deps.llm });
+        const again = await settle(draftReply({ ...common, angle: r2.angle, authorPoint: r2.author_point, chunks: g2.chunks, move: r2.move, depth: r2.depth, posture: r2.posture, energy: r2.energy, experience: g2.experience, fact: g2.fact, unresolved: g2.unresolved, avoidMoves, avoidConcedeOpener: i > 0 }));
+        if (again.ok) {
+          result = again;
+          reasonUsed = r2;
+          groundingUsed = g2;
+          log.info(`reconsidered angle for ${s.post.tweet_url}: ${r2.move}`);
+        }
+      }
+    }
+    // Alternates come from the contribution that was accepted, not the one that may have been reconsidered away.
+    const accepted = reasonUsed === s.reason ? common : { ...common, angle: reasonUsed.angle, authorPoint: reasonUsed.author_point, chunks: groundingUsed.chunks, move: reasonUsed.move, depth: reasonUsed.depth, posture: reasonUsed.posture, energy: reasonUsed.energy, experience: groundingUsed.experience, fact: groundingUsed.fact, unresolved: groundingUsed.unresolved };
     const alternates: string[] = [];
     for (let v = 1; v < config.draftVariants; v += 1) {
-      const alt = await settle(
-        draftReply({
-          post: s.post,
-          theme: s.theme.theme,
-          angle: s.contribution_angle,
-          chunks,
-          tone: deps.kb.tone,
-          maxChars: config.replyMaxChars,
-          constraints: deps.kb.constraints,
-          editorial,
-          avoidPoints: selected.filter((o) => o !== s).map(angleOf),
-          move: s.move,
-          depth: s.depth,
-          posture: s.posture,
-          previousReplies: [result.value.suggested_reply, ...alternates],
-          // The first alternate is always the short version, so the first ♻️
-          // click offers a one-liner rather than another paragraph.
-          ...(v === 1 ? { lengthNudge: "short" as const } : {}),
-          llm: deps.llm,
-        }),
-      );
+      const alt = await settle(draftReply({ ...accepted, previousReplies: [result.value.suggested_reply, ...alternates], ...(v === 1 ? { lengthNudge: "short" as const } : {}) }));
       if (!alt.ok) {
         log.warn(`alternate draft ${v} failed for ${s.post.tweet_url}: ${alt.error.message}`);
         continue;
@@ -460,7 +481,7 @@ export async function runScan(deps: ScanDeps, opts: ScanOptions): Promise<ScanSu
       const text = alt.value.suggested_reply;
       if (text !== result.value.suggested_reply && !alternates.includes(text)) alternates.push(text);
     }
-    return { ok: true as const, value: { ...result.value, alternates } };
+    return { ok: true as const, value: { ...result.value, alternates, grounding: groundingUsed, reason: reasonUsed, dropped: undefined as string | undefined } };
   });
   const ready: ScoredDraft[] = [];
   selected.forEach((s, i) => {
@@ -469,22 +490,39 @@ export async function runScan(deps: ScanDeps, opts: ScanOptions): Promise<ScanSu
       markError(s.post, "draft", d.error.message);
       return;
     }
-    const chunks = s.expertise.chunks.length > 0 ? s.expertise.chunks : s.expertise.retrieved.slice(0, 4);
-    const kbFiles = Array.from(new Set(chunks.map((c) => c.file)));
+    if (d.value.dropped !== undefined || !("suggested_reply" in d.value)) {
+      // The drafter flagged the point and the reasoner, asked again, found nothing worth saying.
+      markFiltered(
+        s.post,
+        "reason",
+        d.value.dropped ?? "reconsidered: none",
+        { theme: s.theme.theme_score, contribution: s.reason.worth },
+        { theme: s.theme.theme, theme_score: s.theme.theme_score, contribution_score: s.reason.worth, contribution_angle: s.reason.angle },
+      );
+      return;
+    }
+    const kbFiles = Array.from(new Set(d.value.grounding.chunks.map((c) => c.file)));
+    const rz = d.value.reason;
+    const move = rz.move;
+    const depth = rz.depth === "deep" && [...s.post.tweet_text].length < 100 ? "substantive" : rz.depth;
     ready.push({
       post: s.post,
       theme: s.theme.theme,
       theme_score: s.theme_score,
-      expertise_score: s.expertise_score,
-      contribution_score: s.contribution_score,
-      contribution_angle: s.contribution_angle,
+      expertise_score: 0,
+      contribution_score: rz.worth,
+      contribution_angle: rz.angle,
       account_priority: s.account.priority,
       kb_files: kbFiles,
       suggested_reply: d.value.suggested_reply,
       ai_tell_flags: d.value.ai_tell_flags,
-      move: s.move,
-      depth: s.depth,
-      posture: s.posture,
+      move,
+      depth,
+      posture: rz.posture,
+      energy: rz.energy,
+      grounding: rz.grounding,
+      worth: rz.worth,
+      ...(d.value.grounding.unresolved ? { unresolved: d.value.grounding.unresolved } : {}),
     });
     if (!opts.dryRun) {
       deps.candidateLog.upsert({
@@ -493,144 +531,26 @@ export async function runScan(deps: ScanDeps, opts: ScanOptions): Promise<ScanSu
         post: s.post,
         theme: s.theme.theme,
         theme_score: s.theme_score,
-        expertise_score: s.expertise_score,
-        contribution_score: s.contribution_score,
-        contribution_angle: s.contribution_angle,
+        expertise_score: 0,
+        contribution_score: rz.worth,
+        contribution_angle: rz.angle,
         account_priority: s.account.priority,
         kb_refs: kbFiles,
-        chunk_refs: chunks.map((c) => c.ref),
+        chunk_refs: d.value.grounding.chunks.map((c) => c.ref),
         replies: [d.value.suggested_reply],
-        moves: [s.move],
-        depth: s.depth,
-        posture: s.posture,
+        moves: [move],
+        depth,
+        posture: rz.posture,
+        grounding: rz.grounding,
+        profile: config.promptProfile,
+        ...(rz.fact_dependency ? { fact_dependency: rz.fact_dependency } : {}),
+        ...(rz.author_point ? { author_point: rz.author_point } : {}),
+        ...(rz.kb_query ? { kb_query: rz.kb_query } : {}),
         ...(d.value.alternates.length > 0 ? { alternates: d.value.alternates } : {}),
       });
     }
   });
   log.info(`${ready.length} replies drafted`);
-
-  // ---- Conversational lane ---------------------------------------------
-  // "Do I just have a good line here?" Author relevance earns entry, a
-  // higher bar than expertise, and a small cap so the Dock stays mostly
-  // professional. Three variants, each a different reply type.
-  const conversational: ScoredDraft[] = [];
-  if (conversationalThemed.length > 0 && deps.policy && config.maxConversationalCandidates > 0) {
-    const policy = deps.policy;
-    const eligible = conversationalThemed.filter(({ post, theme }) => {
-      const account = byHandle.get(post.author_handle.toLowerCase()) ?? { handle: post.author_handle, priority: 2 as const };
-      const e = conversationalEligibility(account.priority, theme.theme, config);
-      if (!e.eligible) markFiltered(post, "line", e.reason ?? "not eligible", { theme: theme.theme_score }, { theme: theme.theme, theme_score: theme.theme_score });
-      return e.eligible;
-    });
-    const lineResults = await mapWithConcurrency(eligible, config.llmConcurrency, ({ post, theme }) =>
-      settle(assessLine(post, theme.theme, { llm: deps.llm, policy, constraints: deps.kb.constraints })),
-    );
-    const good: Array<{ post: NormalizedPost; theme: ThemeResult; line: Awaited<ReturnType<typeof assessLine>>; priority: 1 | 2 | 3 }> = [];
-    eligible.forEach(({ post, theme }, i) => {
-      const r = lineResults[i]!;
-      if (!r.ok) {
-        markError(post, "line", r.error.message);
-        return;
-      }
-      const account = byHandle.get(post.author_handle.toLowerCase()) ?? { handle: post.author_handle, priority: 2 as const };
-      const bar = conversationalEligibility(account.priority, theme.theme, config).threshold;
-      if (r.value.line_type === "none" || r.value.line_score < bar) {
-        markFiltered(
-          post,
-          "line",
-          r.value.line_type === "none" ? `no line (${r.value.line_score}): ${r.value.reason}` : `line ${r.value.line_score} < ${bar}: ${r.value.reason}`,
-          { theme: theme.theme_score, contribution: r.value.line_score },
-          { theme: theme.theme, theme_score: theme.theme_score, contribution_score: r.value.line_score, contribution_angle: r.value.line },
-        );
-        return;
-      }
-      good.push({ post, theme, line: r.value, priority: account.priority });
-    });
-    good.sort((a, b) => b.line.line_score - a.line.line_score || Date.parse(b.post.created_at) - Date.parse(a.post.created_at));
-    const picked = good.slice(0, config.maxConversationalCandidates);
-    for (const g of good.slice(config.maxConversationalCandidates)) {
-      markFiltered(g.post, "rank", `ranked out (conversational cap ${config.maxConversationalCandidates})`, { theme: g.theme.theme_score, contribution: g.line.line_score }, { theme: g.theme.theme, theme_score: g.theme.theme_score, contribution_score: g.line.line_score, contribution_angle: g.line.line });
-    }
-    log.info(`${good.length} conversational candidates${good.length > picked.length ? ` (${picked.length} kept by cap)` : ""}`);
-    await mapWithConcurrency(picked, config.llmConcurrency, async (g) => {
-      const primaryType: LineType = g.line.line_type === "none" ? "light_reaction" : g.line.line_type;
-      const common = {
-        post: g.post,
-        theme: g.theme.theme,
-        angle: g.line.line,
-        chunks: [],
-        tone: deps.kb.tone,
-        maxChars: config.replyMaxChars,
-        constraints: deps.kb.constraints,
-        editorial,
-        lane: "conversational" as const,
-        policy,
-        energy: g.line.energy,
-        llm: deps.llm,
-      };
-      const primary = await settle(draftReply({ ...common, lineType: primaryType }));
-      if (!primary.ok) {
-        markError(g.post, "draft", primary.error.message);
-        return;
-      }
-      const alternates: string[] = [];
-      const usedTypes: string[] = [primaryType];
-      for (let v = 1; v < config.draftVariants; v += 1) {
-        const t = nextLineType(usedTypes);
-        usedTypes.push(t);
-        const alt = await settle(draftReply({ ...common, lineType: t, previousReplies: [primary.value.suggested_reply, ...alternates] }));
-        if (!alt.ok) {
-          log.warn(`alternate draft ${v} failed for ${g.post.tweet_url}: ${alt.error.message}`);
-          continue;
-        }
-        if (alt.value.suggested_reply !== primary.value.suggested_reply && !alternates.includes(alt.value.suggested_reply)) alternates.push(alt.value.suggested_reply);
-      }
-      const draft: ScoredDraft = {
-        post: g.post,
-        theme: g.theme.theme,
-        theme_score: g.theme.theme_score,
-        expertise_score: 0,
-        contribution_score: g.line.line_score,
-        contribution_angle: g.line.line,
-        account_priority: g.priority,
-        kb_files: [],
-        suggested_reply: primary.value.suggested_reply,
-        ai_tell_flags: primary.value.ai_tell_flags,
-        move: primaryType,
-        depth: "light",
-        posture: g.line.energy,
-        lane: "conversational",
-        line_type: primaryType,
-        energy: g.line.energy,
-      };
-      conversational.push(draft);
-      ready.push(draft);
-      if (!opts.dryRun) {
-        deps.candidateLog.upsert({
-          tweet_id: g.post.tweet_id,
-          recorded_at: now().toISOString(),
-          post: g.post,
-          theme: g.theme.theme,
-          theme_score: g.theme.theme_score,
-          expertise_score: 0,
-          contribution_score: g.line.line_score,
-          contribution_angle: g.line.line,
-          account_priority: g.priority,
-          kb_refs: [],
-          chunk_refs: [],
-          replies: [primary.value.suggested_reply],
-          moves: [primaryType],
-          depth: "light",
-          posture: g.line.energy,
-          lane: "conversational",
-          line_type: primaryType,
-          ...(alternates.length > 0 ? { alternates } : {}),
-        });
-      }
-    });
-    // Parallel completion order is arbitrary; keep the Dock order by score.
-    conversational.sort((a, b) => b.contribution_score - a.contribution_score);
-  }
 
   // ---- Send to Wingman -------------------------------------------------
   let sent = 0;
@@ -708,6 +628,7 @@ export async function runScan(deps: ScanDeps, opts: ScanOptions): Promise<ScanSu
     dry_run: opts.dryRun,
     accounts_requested: accounts.length,
     accounts_fetched: fetched.accounts.length - failures.length,
+    accounts_fetched_ok: fetched.accounts.filter((a) => a.ok).map((a) => a.handle),
     account_failures: failures.map((f) => ({ handle: f.handle, error: f.error ?? "unknown" })),
     posts_fetched: fetched.posts.length,
     raw_items: fetched.raw_count,
@@ -715,9 +636,9 @@ export async function runScan(deps: ScanDeps, opts: ScanOptions): Promise<ScanSu
     removed_by_basic_filters: removedByBasic,
     basic_filter_breakdown: breakdown,
     theme_candidates: themed.length,
-    expertise_candidates: expert.length,
+    expertise_candidates: themed.length,
     contribution_candidates: scored.length,
-    conversational_candidates: conversational.length,
+    conversational_candidates: ready.filter((r) => r.grounding === "none").length,
     ranked_out: rankedOut.length,
     drafted: ready.length,
     sent,
@@ -744,6 +665,8 @@ export async function runScan(deps: ScanDeps, opts: ScanOptions): Promise<ScanSu
       ...(r.depth !== undefined ? { depth: r.depth } : {}),
       ...(r.posture !== undefined ? { posture: r.posture } : {}),
       ...(r.lane !== undefined ? { lane: r.lane } : {}),
+      ...(r.grounding !== undefined ? { grounding: r.grounding } : {}),
+      ...(r.worth !== undefined ? { worth: r.worth } : {}),
     })),
     outcomes,
   };

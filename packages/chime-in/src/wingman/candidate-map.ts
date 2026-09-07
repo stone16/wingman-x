@@ -24,6 +24,11 @@ export interface ScoredDraft {
   lane?: "expertise" | "conversational";
   line_type?: string;
   energy?: string;
+  /** Unified engine: how much grounding the reply used, and the worth score. */
+  grounding?: string;
+  worth?: number;
+  /** A factual dependency that could not be verified; shown on the card. */
+  unresolved?: string;
 }
 
 export function candidateId(tweetId: string): string {
@@ -39,7 +44,20 @@ export function formatMatchReason(s: {
   lane?: "expertise" | "conversational";
   line_type?: string;
   energy?: string;
+  grounding?: string;
+  worth?: number;
+  unresolved?: string;
 }): string {
+  if (s.worth !== undefined) {
+    return [
+      `Theme: ${s.theme} (${Math.round(s.theme_score)})`,
+      `Worth: ${Math.round(s.worth)}`,
+      `Move: ${s.line_type ?? "?"}`,
+      `Grounding: ${s.grounding ?? "none"}`,
+      ...(s.unresolved ? [`Unverified: ${s.unresolved}`] : []),
+      `Angle: ${s.contribution_angle.trim()}`,
+    ].join(" | ");
+  }
   if (s.lane === "conversational") {
     return [
       "Lane: conversational",
@@ -65,7 +83,7 @@ export function parseAngleFromMatchReason(reason: string): string | null {
 }
 
 export function toWingmanCandidate(s: ScoredDraft): CandidateInput {
-  const kbRefs = Array.from(new Set([...s.kb_files, ...(s.lane === "conversational" ? ["conversational.md"] : []), "tone.md"]));
+  const kbRefs = Array.from(new Set([...s.kb_files, "tone.md"]));
   const input: CandidateInput = {
     id: candidateId(s.post.tweet_id),
     tweet_id: s.post.tweet_id,
@@ -73,7 +91,7 @@ export function toWingmanCandidate(s: ScoredDraft): CandidateInput {
     author_handle: `@${s.post.author_handle}`,
     tweet_text: s.post.tweet_text,
     suggested_reply: s.suggested_reply,
-    match_reason: formatMatchReason(s),
+    match_reason: formatMatchReason({ ...s, line_type: s.line_type ?? s.move }),
     match_category: s.account_priority === 1 ? "selected" : "topic",
     source: "handles",
     kb_refs: kbRefs,

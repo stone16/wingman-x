@@ -37,13 +37,13 @@ describe("draftReply", () => {
     const labels: string[] = [];
     let n = 0;
     const llm = createFakeProvider(({ label, prompt }) => {
-      labels.push(label);
+      if (!label.startsWith("verify")) labels.push(label);
       n += 1;
       if (n === 1) return { suggested_reply: "the issue isn't jurisdiction, it's the register." };
       expect(prompt).toContain("<has_contrast>");
       return { suggested_reply: "the issue is the register. jurisdiction is a distraction." };
     });
-    const out = await draftReply({ ...base, llm });
+    const out = await draftReply({ ...base, llm, verify: false });
     expect(out.suggested_reply).toBe("The issue is the register. Jurisdiction is a distraction.");
     expect(out.ai_tell_flags).toEqual([]);
     expect(labels).toEqual(["draft:1", "draft:1:contrast"]);
@@ -53,13 +53,13 @@ describe("draftReply", () => {
     const labels: string[] = [];
     let n = 0;
     const llm = createFakeProvider(({ label, prompt }) => {
-      labels.push(label);
+      if (!label.startsWith("verify")) labels.push(label);
       n += 1;
       if (n === 1) return { suggested_reply: "Registration isn't the issue — it's the register." };
       expect(prompt).toContain("<has_dashes>");
       return { suggested_reply: "Registration isn't the issue. The register is." };
     });
-    const out = await draftReply({ ...base, llm });
+    const out = await draftReply({ ...base, llm, verify: false });
     expect(out.suggested_reply).toBe("Registration isn't the issue. The register is.");
     expect(out.ai_tell_flags).toEqual([]);
     expect(out.attempts).toBe(2);
@@ -70,7 +70,7 @@ describe("draftReply", () => {
     const llm = createFakeProvider(() => ({ suggested_reply: "Still — dashed." }));
     const out = await draftReply({ ...base, llm });
     expect(out.ai_tell_flags).toContain("dash");
-    expect(out.attempts).toBe(4);
+    expect(out.attempts).toBe(5);
   });
 
   it("shortens with tightening targets and gives up after the budget", async () => {

@@ -11,10 +11,18 @@ export const SAFETY_PREAMBLE = [
 ].join("\n");
 
 export function renderPost(p: NormalizedPost): string {
-  const lines = [
+  const lines: string[] = [];
+  if (p.thread && p.thread.length > 0) {
+    lines.push(
+      `<thread note="the post below is a reply; these are the earlier posts in the conversation, oldest first. Reply to the post, aware of what it answers.">`,
+      ...p.thread.map((t) => `<earlier${t.author_handle ? ` author="@${t.author_handle}"` : ""}>\n${t.text.trim()}\n</earlier>`),
+      "</thread>",
+    );
+  }
+  lines.push(
     `<post tweet_id="${p.tweet_id}" author="@${p.author_handle}"${p.author_name ? ` name="${p.author_name.replace(/"/g, "'")}"` : ""}>`,
     p.tweet_text.trim(),
-  ];
+  );
   if (p.quoted_tweet) {
     lines.push(
       `<quoted${p.quoted_tweet.author_handle ? ` author="@${p.quoted_tweet.author_handle}"` : ""}>`,

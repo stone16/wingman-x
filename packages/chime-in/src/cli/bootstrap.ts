@@ -18,6 +18,9 @@ import { loadScanState, type ScanState } from "../state/scan-state.js";
 import { createLogger, type Logger } from "../util/logger.js";
 import { loadWatchlist, type WatchAccount } from "../watchlist.js";
 import { loadConversationalPolicy } from "../kb/conversational.js";
+import { loadOptionsPolicy } from "../kb/options.js";
+import { loadAlwaysPresent } from "../kb/always.js";
+import { loadFactArchive, type FactArchive } from "../pipeline/ground.js";
 import { resolveWingmanXStateDir } from "../paths.js";
 
 /** Shared wiring for the bin entrypoints. */
@@ -30,6 +33,13 @@ export interface Runtime {
   themes: string[];
   /** Conversational-lane reply policy text (kb/conversational.md, or the built-in default). */
   policy: string;
+  /** /options policy (kb/options.md, the adapted twitter-reply skill). */
+  optionsPolicy: string;
+  /** Always present for reasoning: working views and the experience map. */
+  digest: string;
+  experienceIndex: string;
+  /** Dated research archive, consulted only for a specific factual dependency. */
+  facts: FactArchive;
   watchlist: WatchAccount[];
   processed: ProcessedStore;
   candidateLog: CandidateLog;
@@ -121,6 +131,13 @@ export async function buildRuntime(flags: CliFlags, options: { needWatchlist: bo
   const llm = createLLMProvider(config, process.env, (l) => log.debug(l));
   const themes = loadThemes(paths.themes);
   const policy = loadConversationalPolicy(resolveWingmanXStateDir());
+  const optionsPolicy = loadOptionsPolicy(resolveWingmanXStateDir());
+  const always = loadAlwaysPresent(resolveWingmanXStateDir());
+  if (always.sources.digest === "missing") log.warn("kb/beliefs-digest.md is missing: the reasoning stage will run without the person's views. Create it beside tone.md.");
+  const facts = loadFactArchive(join(resolveWingmanXStateDir(), "kb", "sources", "research-notes.md"));
+  for (const heading of ["Who is speaking", "What can legitimately be claimed", "Confidentiality", "Facts and verification", "Diplomatic floor", "Lane discipline"]) {
+    if (kb.constraints.trim() && !new RegExp(`^## ${heading}`, "mi").test(kb.constraints)) log.warn(`identity file: section "${heading}" not found; a renamed heading would silently drop that boundary`);
+  }
   const watchlist = options.needWatchlist ? await loadWatchlist(paths.watchlist) : [];
   const processed = flags.dryRun ? createMemoryProcessedStore() : openProcessedStore(paths.processed);
   // Dry runs still need to know what was already processed for "seen".
@@ -130,7 +147,7 @@ export async function buildRuntime(flags: CliFlags, options: { needWatchlist: bo
 
   const models = llm.describeModels();
   log.info(
-    `KB: ${kb.files.length} library file(s), ${kb.chunks.length} excerpt(s) · LLM: ${llm.name} (cheap=${models.cheap}, strong=${models.strong}, draft=${models.draft}) · themes: ${themes.length} · conversational policy: ${policy.source}`,
+    `KB: ${kb.files.length} library file(s), ${kb.chunks.length} excerpt(s) · LLM: ${llm.name} (cheap=${models.cheap}, strong=${models.strong}, draft=${models.draft}) · themes: ${themes.length} · digest: ${always.sources.digest} · facts archive: ${facts.size} entries`,
   );
 
   return {
@@ -141,6 +158,10 @@ export async function buildRuntime(flags: CliFlags, options: { needWatchlist: bo
     llm,
     themes,
     policy: policy.text,
+    optionsPolicy: optionsPolicy.text,
+    digest: always.digest,
+    experienceIndex: always.experienceIndex,
+    facts,
     watchlist,
     processed: flags.dryRun ? withReadOnlySeen(processed, processedForSeen) : processed,
     candidateLog,
@@ -206,13 +227,8 @@ export function printCandidates(log: Logger, summary: ScanSummary): void {
   log.info("Candidates:");
   summary.candidates.forEach((c, i) => {
     log.info(`${i + 1}. @${c.author_handle} — ${c.tweet_url}`);
-    if (c.lane === "conversational") {
-      log.info(`   conversational lane · theme ${c.theme} (${c.theme_score}) · line ${c.contribution_score} · ${c.move ?? "?"} · energy ${c.posture ?? "?"}`);
-      log.info(`   line: ${c.contribution_angle}`);
-    } else {
-      log.info(`   theme ${c.theme} (${c.theme_score}) · expertise ${c.expertise_score} · contribution ${c.contribution_score}`);
-      log.info(`   angle: ${c.contribution_angle}`);
-    }
+    log.info(`   theme ${c.theme} (${c.theme_score}) · worth ${c.worth ?? c.contribution_score} · ${c.move ?? "?"} · ${c.depth ?? "?"} · grounding ${c.grounding ?? "none"}`);
+    log.info(`   angle: ${c.contribution_angle}`);
     log.info(`   reply: ${c.suggested_reply}${c.ai_tell_flags.length ? `  [ai-tell: ${c.ai_tell_flags.join(", ")}]` : ""}`);
   });
 }

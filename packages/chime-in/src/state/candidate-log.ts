@@ -24,6 +24,14 @@ export const CandidateLogRecordSchema = z.object({
   replies: z.array(z.string()),
   /** Conversational move used for each entry in `replies` (parallel; optional for older records). */
   moves: z.array(z.string()).optional(),
+  /** The reasoner's account of what the author was saying; forwarded to the drafter on regeneration. */
+  author_point: z.string().optional(),
+  /** Every contribution tried for this post, oldest first; a plain ♻️ must find one that is not here. */
+  angles: z.array(z.string()).optional(),
+  /** The factual dependency the reasoner named for the current contribution, if any. */
+  fact_dependency: z.string().optional(),
+  /** Prompt profile that produced the current contribution. */
+  profile: z.string().optional(),
   depth: z.string().optional(),
   posture: z.string().optional(),
   /** Pre-generated drafts not yet shown; served on ♻️ without a model call. */
@@ -34,6 +42,13 @@ export const CandidateLogRecordSchema = z.object({
   /** "expertise" (default) or "conversational". */
   lane: z.string().optional(),
   line_type: z.string().optional(),
+  /** Unified engine: grounding decision and library query, for regeneration. */
+  grounding: z.string().optional(),
+  kb_query: z.string().optional(),
+  /** Instruction waiting to be applied on the next regeneration (guided regen). */
+  regen_instruction: z.string().optional(),
+  /** Instructions applied so far, parallel-ish to `replies`. */
+  instructions: z.array(z.string()).optional(),
 });
 export type CandidateLogRecord = z.infer<typeof CandidateLogRecordSchema>;
 
